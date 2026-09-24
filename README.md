@@ -56,7 +56,7 @@ journalctl -u fft-server -f
 ```
 
 ENV: `PORT=8768`, `HOST=0.0.0.0`, `NODE_ENV=production`.
-WorkingDirectory: `/home/claudeuser/sessions/common/workspace/fft-server`.
+WorkingDirectory: `/home/claudeuser/sessions/games/workspace/fft-server`.
 
 ## Данные
 

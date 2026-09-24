@@ -1,14 +1,16 @@
-// FFT-3D multiplayer server — Fastify + SSE + SQLite
+// FFT-3D multiplayer server — Fastify + SSE + WebSocket + SQLite
 // Endpoints:
 //   POST  /api/fft/rooms              → создать комнату
 //   POST  /api/fft/rooms/:id/join     → присоединиться гостем
 //   GET   /api/fft/rooms/:id          → получить состояние
 //   POST  /api/fft/rooms/:id/action   → применить действие (идемпотентно)
 //   GET   /api/fft/rooms/:id/events   → SSE поток
+//   GET   /api/fft/rooms/:id/ws       → WebSocket (token query)
 //   GET   /api/fft/health             → статус
 
 import Fastify from 'fastify';
 import cors from '@fastify/cors';
+import websocket from '@fastify/websocket';
 import Database from 'better-sqlite3';
 import { v4 as uuidv4 } from 'uuid';
 import * as fs from 'fs';
@@ -125,6 +127,8 @@ function upsertRoom(
 // ─── SSE подписчики ──────────────────────────────────────────────────────────
 
 const subscribers = new Map<string, Set<(s: GameState) => void>>();
+// X: chat subscribers — отдельный канал для chat-msg (не меняет GameState)
+const chatSubscribers = new Map<string, Set<(msg: string) => void>>();
 
 function subscribe(roomId: string, cb: (s: GameState) => void): () => void {
   if (!subscribers.has(roomId)) subscribers.set(roomId, new Set());
@@ -132,8 +136,101 @@ function subscribe(roomId: string, cb: (s: GameState) => void): () => void {
   return () => subscribers.get(roomId)?.delete(cb);
 }
 
+function subscribeChat(roomId: string, cb: (msg: string) => void): () => void {
+  if (!chatSubscribers.has(roomId)) chatSubscribers.set(roomId, new Set());
+  chatSubscribers.get(roomId)!.add(cb);
+  return () => chatSubscribers.get(roomId)?.delete(cb);
+}
+
 function broadcast(roomId: string, state: GameState): void {
   subscribers.get(roomId)?.forEach(cb => cb(state));
+}
+
+function broadcastChat(roomId: string, msg: string): void {
+  chatSubscribers.get(roomId)?.forEach(cb => cb(msg));
+}
+
+// ─── WS clients (для peerMove и учёта сокетов) ───────────────────────────────
+
+type WsSocket = { readyState: number; send: (data: string) => void; on: (event: string, cb: (...args: unknown[]) => void) => void; close: () => void };
+const wsRoomClients = new Map<string, Set<WsSocket>>();
+
+function addWsClient(roomId: string, socket: WsSocket): () => void {
+  if (!wsRoomClients.has(roomId)) wsRoomClients.set(roomId, new Set());
+  wsRoomClients.get(roomId)!.add(socket);
+  return () => wsRoomClients.get(roomId)?.delete(socket);
+}
+
+function broadcastWsExtra(roomId: string, payload: string, except?: WsSocket): void {
+  wsRoomClients.get(roomId)?.forEach(s => {
+    if (s !== except && s.readyState === 1) s.send(payload);
+  });
+}
+
+// ─── Shared action helper (POST + WS) ────────────────────────────────────────
+
+function handleRoomAction(
+  roomId: string,
+  token: string,
+  body: { actionId?: string; type: string; [key: string]: unknown },
+  opts?: { skipBroadcast?: boolean },
+): { status: number; body: Record<string, unknown>; applied: boolean } {
+  if (!token) {
+    return { status: 401, body: { error: 'Требуется X-Session-Token' }, applied: false };
+  }
+
+  const room = getRoom(roomId);
+  if (!room) {
+    return { status: 404, body: { error: 'Комната не найдена' }, applied: false };
+  }
+
+  let actorTeam: 'A' | 'B';
+  if (token === room.hostToken) actorTeam = 'A';
+  else if (token === room.guestToken) actorTeam = 'B';
+  else {
+    return { status: 403, body: { error: 'Неверный токен' }, applied: false };
+  }
+
+  const { actionId, ...action } = body;
+  if (actionId) {
+    const cacheKey = `${roomId}:${token}:${actionId}`;
+    if (actionCache.has(cacheKey)) {
+      return {
+        status: 200,
+        body: JSON.parse(actionCache.get(cacheKey)!) as Record<string, unknown>,
+        applied: false,
+      };
+    }
+  }
+
+  if (actorTeam === 'A') room.state.playerA.lastSeenAt = Date.now();
+  else room.state.playerB.lastSeenAt = Date.now();
+
+  const result = applyAction(room.state, actorTeam, action as Record<string, unknown>);
+
+  if (!result.ok) {
+    return { status: 400, body: result as unknown as Record<string, unknown>, applied: false };
+  }
+
+  upsertRoom(roomId, room.state, room.hostToken, room.guestToken);
+  if (!opts?.skipBroadcast) {
+    broadcast(roomId, room.state);
+  }
+
+  const responseBody: Record<string, unknown> = { ok: true, state: room.state, actorTeam };
+
+  if (actionId) {
+    const cacheKey = `${roomId}:${token}:${actionId}`;
+    // Cache without actorTeam to keep HTTP response shape identical
+    const cached = { ok: true, state: room.state };
+    actionCache.set(cacheKey, JSON.stringify(cached));
+    if (actionCache.size > 10_000) {
+      const firstKey = actionCache.keys().next().value;
+      if (firstKey) actionCache.delete(firstKey);
+    }
+  }
+
+  return { status: 200, body: responseBody, applied: true };
 }
 
 // ─── Fastify сервер ──────────────────────────────────────────────────────────
@@ -147,6 +244,8 @@ await app.register(cors, {
   origin: true,
   methods: ['GET', 'POST', 'OPTIONS'],
 });
+
+await app.register(websocket);
 
 // GET /api/fft/health
 app.get('/api/fft/health', async () => ({
@@ -243,53 +342,36 @@ app.post<{
 }>('/api/fft/rooms/:id/action', async (req, reply) => {
   const roomId = req.params.id.toUpperCase();
   const token = (req.headers['x-session-token'] ?? '') as string;
+  const result = handleRoomAction(roomId, token, req.body ?? { type: '' });
+  // Strip internal actorTeam from HTTP response
+  const { actorTeam: _at, ...httpBody } = result.body;
+  if (result.status !== 200) {
+    return reply.code(result.status).send(httpBody);
+  }
+  return httpBody;
+});
+
+// POST /api/fft/rooms/:id/chat — X: отправить chat-msg сопернику через SSE
+app.post<{
+  Params: { id: string };
+  Body: { msg: string };
+}>('/api/fft/rooms/:id/chat', async (req, reply) => {
+  const roomId = req.params.id.toUpperCase();
+  const token = (req.headers['x-session-token'] ?? '') as string;
   if (!token) return reply.code(401).send({ error: 'Требуется X-Session-Token' });
 
   const room = getRoom(roomId);
   if (!room) return reply.code(404).send({ error: 'Комната не найдена' });
 
-  // Определяем команду по токену
-  let actorTeam: 'A' | 'B';
-  if (token === room.hostToken) actorTeam = 'A';
-  else if (token === room.guestToken) actorTeam = 'B';
-  else return reply.code(403).send({ error: 'Неверный токен' });
-
-  // Идемпотентность по actionId
-  const { actionId, ...action } = req.body;
-  if (actionId) {
-    const cacheKey = `${roomId}:${token}:${actionId}`;
-    if (actionCache.has(cacheKey)) {
-      return JSON.parse(actionCache.get(cacheKey)!);
-    }
+  if (token !== room.hostToken && token !== room.guestToken) {
+    return reply.code(403).send({ error: 'Неверный токен' });
   }
 
-  // Обновляем lastSeenAt
-  if (actorTeam === 'A') room.state.playerA.lastSeenAt = Date.now();
-  else room.state.playerB.lastSeenAt = Date.now();
+  const msg = String(req.body?.msg ?? '').slice(0, 100);
+  if (!msg) return reply.code(400).send({ error: 'msg обязателен' });
 
-  const result = applyAction(room.state, actorTeam, action as Record<string, unknown>);
-
-  if (!result.ok) {
-    return reply.code(400).send(result);
-  }
-
-  upsertRoom(roomId, room.state, room.hostToken, room.guestToken);
-  broadcast(roomId, room.state);
-
-  const responseBody = { ok: true, state: room.state };
-
-  // Кэшируем ответ для идемпотентности
-  if (actionId) {
-    const cacheKey = `${roomId}:${token}:${actionId}`;
-    actionCache.set(cacheKey, JSON.stringify(responseBody));
-    // Ограничиваем размер кэша
-    if (actionCache.size > 10_000) {
-      const firstKey = actionCache.keys().next().value;
-      if (firstKey) actionCache.delete(firstKey);
-    }
-  }
-
-  return responseBody;
+  broadcastChat(roomId, msg);
+  return { ok: true };
 });
 
 // GET /api/fft/rooms/:id/events — SSE
@@ -316,9 +398,14 @@ app.get<{ Params: { id: string }; Querystring: { token?: string } }>(
     // Первый снимок сразу
     reply.raw.write(`event: state\ndata: ${JSON.stringify({ type: 'state', state: room.state })}\n\n`);
 
-    // Подписываемся на обновления
+    // Подписываемся на обновления GameState
     const unsub = subscribe(roomId, (state) => {
       reply.raw.write(`event: state\ndata: ${JSON.stringify({ type: 'state', state })}\n\n`);
+    });
+
+    // X: подписываемся на chat-msg
+    const unsubChat = subscribeChat(roomId, (msg) => {
+      reply.raw.write(`event: chat\ndata: ${JSON.stringify({ type: 'chat', msg })}\n\n`);
     });
 
     // Heartbeat каждые 25с
@@ -328,11 +415,123 @@ app.get<{ Params: { id: string }; Querystring: { token?: string } }>(
 
     req.socket.on('close', () => {
       unsub();
+      unsubChat();
       clearInterval(heartbeat);
     });
 
     return reply;
   }
+);
+
+// GET /api/fft/rooms/:id/ws — WebSocket
+app.get<{ Params: { id: string }; Querystring: { token?: string } }>(
+  '/api/fft/rooms/:id/ws',
+  { websocket: true },
+  (socket, req) => {
+    const roomId = req.params.id.toUpperCase();
+    const token = req.query.token ?? '';
+    const room = getRoom(roomId);
+
+    if (!room || (token !== room.hostToken && token !== room.guestToken)) {
+      socket.send(JSON.stringify({ type: 'error', error: !room ? 'Комната не найдена' : 'Требуется token' }));
+      socket.close();
+      return;
+    }
+
+    const removeClient = addWsClient(roomId, socket as unknown as WsSocket);
+
+    // Snapshot
+    socket.send(JSON.stringify({ type: 'state', state: room.state }));
+
+    const unsub = subscribe(roomId, (state) => {
+      if (socket.readyState === 1) {
+        socket.send(JSON.stringify({ type: 'state', state }));
+      }
+    });
+
+    const unsubChat = subscribeChat(roomId, (msg) => {
+      if (socket.readyState === 1) {
+        socket.send(JSON.stringify({ type: 'chat', msg }));
+      }
+    });
+
+    const cleanup = () => {
+      unsub();
+      unsubChat();
+      removeClient();
+    };
+    socket.on('close', cleanup);
+
+    socket.on('message', (raw: unknown) => {
+      let msg: Record<string, unknown>;
+      try {
+        msg = JSON.parse(String(raw)) as Record<string, unknown>;
+      } catch {
+        socket.send(JSON.stringify({ type: 'error', error: 'Invalid JSON' }));
+        return;
+      }
+
+      const type = msg.type as string;
+
+      // ping → literal echo for wscat DoD
+      if (type === 'ping') {
+        socket.send(JSON.stringify({ type: 'ping' }));
+        return;
+      }
+
+      // Alias map camelCase → kebab for applyAction
+      const aliases: Record<string, string> = {
+        endTurn: 'end-turn',
+        skillSelect: 'set-skills',
+      };
+      if (aliases[type]) msg.type = aliases[type];
+
+      // Normalize move fields: col/row → targetCol/targetRow if missing
+      if (msg.type === 'move') {
+        if (msg.targetCol == null && msg.col != null) msg.targetCol = msg.col;
+        if (msg.targetRow == null && msg.row != null) msg.targetRow = msg.row;
+      }
+
+      const allowed = new Set([
+        'move', 'attack', 'jump', 'push', 'skip-unit', 'end-turn', 'set-skills', 'ready', 'resign',
+      ]);
+      if (!allowed.has(msg.type as string)) {
+        socket.send(JSON.stringify({ type: 'error', error: `Unknown type: ${msg.type}` }));
+        return;
+      }
+
+      const result = handleRoomAction(
+        roomId,
+        token,
+        msg as { actionId?: string; type: string; [key: string]: unknown },
+        { skipBroadcast: true },
+      );
+
+      if (result.status >= 400 || !(result.body as { ok?: boolean }).ok) {
+        socket.send(JSON.stringify({
+          type: 'error',
+          error: (result.body as { error?: string }).error ?? 'Action failed',
+        }));
+        return;
+      }
+
+      // Cache hit: no peerMove, no re-broadcast
+      if (!result.applied) return;
+
+      // peerMove before state so peers animate first
+      if (msg.type === 'move' || type === 'move') {
+        const peerPayload = JSON.stringify({
+          type: 'peerMove',
+          unitId: msg.unitId,
+          targetCol: msg.targetCol,
+          targetRow: msg.targetRow,
+          team: result.body.actorTeam,
+        });
+        broadcastWsExtra(roomId, peerPayload, socket as unknown as WsSocket);
+      }
+      broadcast(roomId, result.body.state as GameState);
+    });
+  },
 );
 
 // ─── Server timer sweep (каждые 10с) ─────────────────────────────────────────
