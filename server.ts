@@ -7,6 +7,7 @@
 //   GET   /api/fft/rooms/:id/events   → SSE поток
 //   GET   /api/fft/rooms/:id/ws       → WebSocket (token query)
 //   GET   /api/fft/health             → статус
+//   POST  /api/fft/scene/generate    → LLM генерация сценария
 
 import Fastify from 'fastify';
 import cors from '@fastify/cors';
@@ -18,6 +19,14 @@ import * as path from 'path';
 
 import { GameState, createInitialState, DISCONNECT_TIMEOUT_MS } from './state';
 import { applyAction, checkAndApplyTimerSweep, checkDisconnect } from './actions';
+
+import { config as loadDotenv } from 'dotenv';
+// Load .env from cwd, source root, or parent of dist/
+loadDotenv();
+loadDotenv({ path: path.join(__dirname, '.env') });
+loadDotenv({ path: path.join(__dirname, '..', '.env') });
+
+import { generateScene } from './scene-generator';
 
 // ─── База данных ─────────────────────────────────────────────────────────────
 
@@ -531,6 +540,67 @@ app.get<{ Params: { id: string }; Querystring: { token?: string } }>(
       }
       broadcast(roomId, result.body.state as GameState);
     });
+  },
+);
+
+
+// POST /api/fft/scene/generate — F1: LLM scenario from natural language
+app.post<{ Body: { description?: string; seed?: number } }>(
+  '/api/fft/scene/generate',
+  async (req, reply) => {
+    const ip = req.ip;
+    if (!checkRateLimit(ip)) {
+      return reply.code(429).send({ error: 'Too many requests. Лимит: 5 generate в минуту.' });
+    }
+
+    const description = String(req.body?.description ?? '').trim();
+    if (!description) {
+      return reply.code(400).send({ error: 'description обязателен' });
+    }
+
+    if (!process.env.GOLEM_TOKEN) {
+      return reply.code(503).send({ error: 'GOLEM_TOKEN не настроен на сервере' });
+    }
+
+    const seedRaw = req.body?.seed;
+    const seed =
+      seedRaw === undefined || seedRaw === null || seedRaw === ('' as unknown)
+        ? undefined
+        : Number(seedRaw);
+    if (seed !== undefined && !Number.isFinite(seed)) {
+      return reply.code(400).send({ error: 'seed должен быть числом' });
+    }
+
+    let scenario;
+    try {
+      scenario = await generateScene({ description, seed });
+    } catch (e) {
+      const msg = (e as Error).message || 'generate failed';
+      app.log.error({ err: msg }, 'scene generate failed');
+      const status = msg.includes('GOLEM_TOKEN') ? 503 : 502;
+      return reply.code(status).send({ error: msg });
+    }
+
+    const ts = Date.now();
+    const id = `generated-${ts}`;
+    scenario.id = id;
+
+    const fftPath = `/var/www/loreworlds/fft-3d/scenarios/${id}.json`;
+    const mechPath = `/var/www/loreworlds/mech/scenarios/${id}.json`;
+    const payload = JSON.stringify(scenario, null, 2);
+
+    try {
+      fs.writeFileSync(fftPath, payload, 'utf-8');
+      if (fs.existsSync(path.dirname(mechPath))) {
+        fs.writeFileSync(mechPath, payload, 'utf-8');
+      }
+    } catch (e) {
+      app.log.error({ err: (e as Error).message }, 'scenario file write failed');
+      // Still return scenario so client can launch via object
+      return { scenario, id, wrote: false, writeError: (e as Error).message };
+    }
+
+    return { scenario, id, wrote: true };
   },
 );
 
