@@ -244,11 +244,17 @@ export async function registerMasterRoutes(app: FastifyInstance): Promise<void> 
         }
 
         // engineEvent от игрока (logAction / unitMoved / damageDealt / etc)
-        // → relay всем остальным клиентам комнаты (observer'ам)
+        // → relay только observer'ам (исключаем отправителя — иначе игрок получает собственный event обратно)
         if (msg.kind === 'engineEvent') {
           if (role !== 'player') return;  // только игрок эмитит engineEvents
           if (!room) return;
-          broadcastMaster(roomId, msg);
+          const senderId = clientId;
+          for (const c of room.wsClients) {
+            if (c.clientId === senderId) continue;
+            if ((c.ws as any).readyState === 1) {
+              try { (c.ws as any).send(JSON.stringify(msg)); } catch {}
+            }
+          }
           return;
         }
 
