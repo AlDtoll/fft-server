@@ -25,8 +25,11 @@ import { config as loadDotenv } from 'dotenv';
 loadDotenv();
 loadDotenv({ path: path.join(__dirname, '.env') });
 loadDotenv({ path: path.join(__dirname, '..', '.env') });
+// Загружаем глобальные секреты (MASTER_SECRET и прочее)
+loadDotenv({ path: '/home/claudeuser/.claude/env/secrets.env', override: false });
 
 import { generateScene } from './scene-generator';
+import { registerMasterRoutes } from './master';
 
 // ─── База данных ─────────────────────────────────────────────────────────────
 
@@ -245,7 +248,7 @@ function handleRoomAction(
 // ─── Fastify сервер ──────────────────────────────────────────────────────────
 
 const START_TS = Date.now();
-const app = Fastify({ logger: true });
+const app = Fastify({ logger: true, trustProxy: true });
 
 void (async () => {
 
@@ -255,6 +258,9 @@ await app.register(cors, {
 });
 
 await app.register(websocket);
+
+// Мастер-маршруты (наблюдение и управление)
+await registerMasterRoutes(app);
 
 // GET /api/fft/health
 app.get('/api/fft/health', async () => ({
