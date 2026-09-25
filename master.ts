@@ -243,6 +243,15 @@ export async function registerMasterRoutes(app: FastifyInstance): Promise<void> 
           return;
         }
 
+        // engineEvent от игрока (logAction / unitMoved / damageDealt / etc)
+        // → relay всем остальным клиентам комнаты (observer'ам)
+        if (msg.kind === 'engineEvent') {
+          if (role !== 'player') return;  // только игрок эмитит engineEvents
+          if (!room) return;
+          broadcastMaster(roomId, msg);
+          return;
+        }
+
         // pong-ответ на heartbeat
         if (msg.kind === 'pong') return;
       });
