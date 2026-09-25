@@ -161,8 +161,12 @@ function applyMove(state: GameState, actorTeam: Team, action: Record<string, unk
   if (state.currentTeam !== actorTeam) return { ok: false, error: 'Не ваш ход' };
 
   const unitId = action.unitId as string;
-  const targetCol = action.targetCol as number;
-  const targetRow = action.targetRow as number;
+  // v4 fix 15: клиент шлёт {col, row} (см. index.html:submitAction 'move'),
+  // сервер раньше читал только action.targetCol/targetRow → оба undefined,
+  // unit.col/row перезаписывались на undefined → грид ломался, action-log
+  // писал "A1 переместился на (undefined,undefined)". Принимаем оба формата.
+  const targetCol = (action.targetCol ?? action.col) as number;
+  const targetRow = (action.targetRow ?? action.row) as number;
 
   const unit = findUnit(state, unitId);
   if (!unit) return { ok: false, error: 'Юнит не найден' };
@@ -171,6 +175,9 @@ function applyMove(state: GameState, actorTeam: Team, action: Record<string, unk
   if (unit.moved) return { ok: false, error: 'Юнит уже двигался в этот ход' };
   if (unit.statusEffects.stun || unit.statusEffects.immobilize) {
     return { ok: false, error: 'Юнитездиммобилизован/оглушён' };
+  }
+  if (typeof targetCol !== 'number' || typeof targetRow !== 'number') {
+    return { ok: false, error: 'Требуется col и row (или targetCol/targetRow)' };
   }
 
   const dist = hexDist(unit.col, unit.row, targetCol, targetRow);
@@ -323,8 +330,9 @@ function applyJump(state: GameState, actorTeam: Team, action: Record<string, unk
   if (state.currentTeam !== actorTeam) return { ok: false, error: 'Не ваш ход' };
 
   const unitId = action.unitId as string;
-  const targetCol = action.targetCol as number;
-  const targetRow = action.targetRow as number;
+  // v4 fix 15 (same for jump-action): accept client's {col,row} in addition to targetCol/targetRow
+  const targetCol = (action.targetCol ?? action.col) as number;
+  const targetRow = (action.targetRow ?? action.row) as number;
 
   const unit = findUnit(state, unitId);
   if (!unit) return { ok: false, error: 'Юнит не найден' };
