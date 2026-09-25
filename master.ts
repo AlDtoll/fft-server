@@ -219,6 +219,30 @@ export async function registerMasterRoutes(app: FastifyInstance): Promise<void> 
           return;
         }
 
+        // masterAction — действие от observer (v2)
+        // Observer отправляет действие, сервер транслирует как masterEffect всем клиентам
+        if (msg.kind === 'masterAction') {
+          if (role !== 'observer') return;  // только observer может слать
+          const ALLOWED_ACTIONS = new Set([
+            'moveUnit', 'setHp', 'setMaxHp', 'applyStatus',
+            'info', 'terrainSet', 'spawnUnit', 'removeUnit',
+          ]);
+          const action = msg.action as string;
+          if (!action || !ALLOWED_ACTIONS.has(action)) return;
+          // Маппинг: capitalize первой буквы → тип эффекта
+          const effectType = action[0].toUpperCase() + action.slice(1);
+          const effect: Record<string, unknown> = { ...msg, type: effectType };
+          delete effect.kind;
+          delete effect.action;
+          const queueId = uuidv4();
+          if (room) {
+            room.effectQueue.push({ id: queueId, effects: [effect] });
+            broadcastMaster(roomId, { kind: 'masterEffect', queueId, effects: [effect] });
+            app.log.info({ roomId, action, effectType }, 'master: observer masterAction');
+          }
+          return;
+        }
+
         // pong-ответ на heartbeat
         if (msg.kind === 'pong') return;
       });
